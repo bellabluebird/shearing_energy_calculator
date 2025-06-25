@@ -35,35 +35,24 @@
 # visual graphs of the equations above
 # recommendations
 
-# dna shearing energy calculator
-# this version uses only base r and shiny (no other packages required)
-
 library(shiny)
 
 # Define UI
 ui <- fluidPage(
+  titlePanel("DNA Shearing Energy Calculator v1"),
   
-  titlePanel("DNA Shearing Energy Calculator"),
-  
+  # setting up the gui
   sidebarLayout(
     sidebarPanel(
-      fileInput("datafile", "Choose CSV File",
-                accept = c(".csv")),
+      fileInput("datafile", "Choose CSV File", accept = c(".csv")),
       helpText("CSV should have at least 17 columns:",
                "Column 2 = Device, Column 3 = Vessel,",
                "Column 10 = Base Pair (bp), Column 17 = Energy (J)"),
       
       hr(),
-      
-      selectInput("device", "Select Device:",
-                  choices = list("Upload data first" = ""), selected = ""),
-      
-      selectInput("vessel", "Select Vessel:",
-                  choices = list("Select device first" = ""), selected = ""),
-      
-      sliderInput("target_bp", "Target Base Pair (bp):",
-                  min = 50, max = 5000, value = 500, step = 25),
-      
+      selectInput("device", "Select Device:", choices = list("Upload data first" = ""), selected = ""),
+      selectInput("vessel", "Select Vessel:", choices = list("Select device first" = ""), selected = ""),
+      sliderInput("target_bp", "Target Base Pair (bp):", min = 50, max = 5000, value = 500, step = 50),
       actionButton("calculate", "Calculate Energy"),
       
       hr(),
@@ -89,7 +78,18 @@ ui <- fluidPage(
         
         tabPanel("Diagnostics",
                  h4("Model Diagnostic Plots"),
-                 plotOutput("diagnostic_plot"))
+                 plotOutput("diagnostic_plot")),
+        
+        tabPanel("Model Equations",
+                 h4("Summary Statistics"),
+                 verbatimTextOutput("equation_summary"),
+                 hr(),
+                 h4("Log-Poly2 Model Coefficients for All Device-Vessel Combinations"),
+                 tableOutput("log_poly2_table"),
+                 downloadButton("download_log_poly2", "Download All Log-Poly2 Equations"),
+                 hr(),
+                 h4("Example Log-Poly2 Curves (First 4)"),
+                 plotOutput("log_poly2_plot"))
       )
     )
   )
@@ -107,6 +107,101 @@ server <- function(input, output, session) {
     )
     df
   })
+  # automatically calculate log_poly2 models for all device/vessel combinations
+  all_equations <- reactive({
+    req(uploaded_data())
+    
+    # get all unique device/vessel combinations
+    data <- uploaded_data()
+    unique_combos <- unique(data[, c(2, 3)])  # columns 2 and 3
+    colnames(unique_combos) <- c("device", "vessel")
+    
+    # initialize empty list to store results
+    results_list <- list()
+    
+    # loop through each combination
+    for(i in 1:nrow(unique_combos)) {
+      device <- unique_combos$device[i]
+      vessel <- unique_combos$vessel[i]
+      
+      # filter data for this combination
+      filtered <- data[data[, 2] == device & data[, 3] == vessel, ]
+      
+      # extract bp and energy values
+      bp_mode <- as.numeric(filtered[, 10])
+      energy_j <- as.numeric(filtered[, 17])
+      
+      # remove NAs
+      valid <- !is.na(bp_mode) & !is.na(energy_j) & energy_j > 0 & bp_mode > 0
+      bp_mode <- bp_mode[valid]
+      energy_j <- energy_j[valid]
+      
+      # skip if not enough data points
+      if(length(bp_mode) < 3) {
+        results_list[[i]] <- data.frame(
+          device = device,
+          vessel = vessel,
+          n_points = length(bp_mode),
+          intercept = NA,
+          bp_coef = NA,
+          bp2_coef = NA,
+          r_squared = NA,
+          adj_r_squared = NA,
+          rse = NA,
+          bp_min = NA,
+          bp_max = NA,
+          status = "insufficient data"
+        )
+        next
+      }
+      # try to fit log_poly2 model
+      tryCatch({
+        # fit the model: log(energy) = b0 + b1*bp + b2*bp^2
+        model <- lm(log(energy_j) ~ poly(bp_mode, 2, raw = TRUE))
+        
+        # extract coefficients
+        coefs <- coef(model)
+        
+        # get model statistics
+        model_summary <- summary(model)
+        
+        # store results
+        results_list[[i]] <- data.frame(
+          device = device,
+          vessel = vessel,
+          n_points = length(bp_mode),
+          intercept = coefs[1],
+          bp_coef = coefs[2],
+          bp2_coef = coefs[3],
+          r_squared = model_summary$r.squared,
+          adj_r_squared = model_summary$adj.r.squared,
+          rse = model_summary$sigma,
+          bp_min = min(bp_mode),
+          bp_max = max(bp_mode),
+          status = "success"
+        )
+      }, error = function(e) {
+        # if model fails, store NA values
+        results_list[[i]] <- data.frame(
+          device = device,
+          vessel = vessel,
+          n_points = length(bp_mode),
+          intercept = NA,
+          bp_coef = NA,
+          bp2_coef = NA,
+          r_squared = NA,
+          adj_r_squared = NA,
+          rse = NA,
+          bp_min = min(bp_mode),
+          bp_max = max(bp_mode),
+          status = paste("error:", e$message)
+        )
+      })
+    }
+    # combine all results into one dataframe
+    do.call(rbind, results_list)
+  })
+  
   # populating the device dropdown with all options in the csv
   observe({
     req(uploaded_data())
@@ -123,8 +218,11 @@ server <- function(input, output, session) {
   
   # storage variable for best-fit model
   current_model <- reactiveVal(NULL)
+  # it seems like log_poly2 is the best across the board, let's
+  # make a dataframe to store all equations for each vessel
+  all_log_poly2_models <- reactiveVal(data.frame())
   
-  # ok this is where the math is happening
+  # model selection
   # when you click calculate: 
   observeEvent(input$calculate, {
     # filter dataset by device and vessel yippee!
@@ -345,6 +443,112 @@ server <- function(input, output, session) {
     req(uploaded_data())
     head(uploaded_data(), 10)
   })
+  
+  # create example plots showing the first 4 equations
+  output$log_poly2_plot <- renderPlot({
+    req(all_equations())
+    
+    # get equations with successful fits
+    equations_df <- all_equations()
+    successful <- equations_df[equations_df$status == "success", ]
+    
+    # limit to first 4 for display
+    n_plots <- min(4, nrow(successful))
+    
+    if(n_plots == 0) {
+      plot(1, type = "n", xlab = "", ylab = "", main = "No successful models to display")
+      return()
+    }
+    
+    # set up plot grid
+    par(mfrow = c(2, 2))
+    
+    # plot each equation
+    for(i in 1:n_plots) {
+      row <- successful[i, ]
+      
+      # create bp sequence for smooth curve
+      bp_seq <- seq(row$bp_min, row$bp_max, length.out = 100)
+      
+      # calculate predicted energy using the equation
+      log_energy <- row$intercept + row$bp_coef * bp_seq + row$bp2_coef * bp_seq^2
+      energy <- exp(log_energy)
+      
+      # plot
+      plot(bp_seq, energy,
+           type = "l",
+           col = "blue",
+           lwd = 2,
+           main = paste(row$device, "-", row$vessel),
+           xlab = "Base Pair (bp)",
+           ylab = "Energy (J)",
+           sub = paste("R² =", round(row$r_squared, 3)))
+      
+      # add grid
+      grid()
+    }
+    
+    # reset plot parameters
+    par(mfrow = c(1, 1))
+  })
+  
+  # display the equations table
+  output$log_poly2_table <- renderTable({
+    req(all_equations())
+    
+    # format the dataframe for display
+    display_df <- all_equations()
+    
+    # round numeric columns for better display
+    numeric_cols <- c("intercept", "bp_coef", "bp2_coef", "r_squared", "adj_r_squared", "rse")
+    display_df[numeric_cols] <- lapply(display_df[numeric_cols], function(x) round(x, 6))
+    
+    # add equation column for easy reading
+    display_df$equation <- ifelse(
+      !is.na(display_df$intercept),
+      paste0("log(E) = ", 
+             round(display_df$intercept, 3), " + ",
+             round(display_df$bp_coef, 6), "*bp + ",
+             round(display_df$bp2_coef, 9), "*bp²"),
+      "N/A"
+    )
+    
+    display_df
+  })
+  
+  # download handler for the equations
+  output$download_log_poly2 <- downloadHandler(
+    filename = function() {
+      paste0("dna_shearing_equations_", Sys.Date(), ".csv")
+    },
+    content = function(file) {
+      # get the equations dataframe
+      equations_df <- all_equations()
+      
+      # add some additional columns that might be useful
+      equations_df$equation_string <- ifelse(
+        !is.na(equations_df$intercept),
+        paste0("log(E) = ", 
+               equations_df$intercept, " + ",
+               equations_df$bp_coef, "*bp + ",
+               equations_df$bp2_coef, "*bp^2"),
+        "N/A"
+      )
+      
+      # add back-transformation note
+      equations_df$energy_formula <- ifelse(
+        !is.na(equations_df$intercept),
+        paste0("E = exp(", 
+               equations_df$intercept, " + ",
+               equations_df$bp_coef, "*bp + ",
+               equations_df$bp2_coef, "*bp^2)"),
+        "N/A"
+      )
+      
+      # write to csv
+      write.csv(equations_df, file, row.names = FALSE)
+    }
+  )
 }
 
 # launch the app! yippee!
