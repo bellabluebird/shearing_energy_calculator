@@ -1,0 +1,351 @@
+# DNA Shearing Energy Calculator
+# this version uses only base R and shiny (no other packages required)
+
+# user selection screen
+# dropdown: select device (col B)
+# dropdown: select from vessels available on this device (col C)
+# dropdown: select target BP shearing via a slider
+
+# my hypothesis is that we can effectively calculate the total energy input 
+# required to shear to a target base pair based on the instrument and 
+# consumable that a customer is using. We have data for the amount of energy
+# required to shear to a few different measurements, but I want to find
+# intermediaries and special cases.
+
+# I'm drawing from:
+# Available protocols on the Covaris website
+# Julie's doc (DNA Shearing Protocols Sept 2020)
+# Anything else?
+
+# after graphing the energy input (J), we can figure out how to adjust other
+# paramaters to get to that number while preserving quality of the sample
+# and keeping time relatively low. I'm not sure what the most effective way
+# to do this & I'll need help from other team members on what they've
+# seen in the past. I'm not tackling this until later but I added the view
+# and some fake math to make our lives easier in the future.
+
+# what should be happening under the hood:
+# identifying the best model for different devices/vessels
+# creating individual equations to model Energy (J) (col Q)
+# to Base Pair Mode (bp) (col J) for each Vessel (col C) and storing
+# those equations in a new dataframe. Give other statistics to indicate 
+# model accuracy.
+
+# what the user should be able to see:
+# visual graphs of the equations above
+# recommendations
+
+# dna shearing energy calculator
+# this version uses only base r and shiny (no other packages required)
+
+library(shiny)
+
+# Define UI
+ui <- fluidPage(
+  
+  titlePanel("DNA Shearing Energy Calculator"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      fileInput("datafile", "Choose CSV File",
+                accept = c(".csv")),
+      helpText("CSV should have at least 17 columns:",
+               "Column 2 = Device, Column 3 = Vessel,",
+               "Column 10 = Base Pair (bp), Column 17 = Energy (J)"),
+      
+      hr(),
+      
+      selectInput("device", "Select Device:",
+                  choices = list("Upload data first" = ""), selected = ""),
+      
+      selectInput("vessel", "Select Vessel:",
+                  choices = list("Select device first" = ""), selected = ""),
+      
+      sliderInput("target_bp", "Target Base Pair (bp):",
+                  min = 50, max = 5000, value = 500, step = 25),
+      
+      actionButton("calculate", "Calculate Energy"),
+      
+      hr(),
+      h4("Model Statistics"),
+      verbatimTextOutput("model_stats")
+    ),
+    
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Energy vs Base Pair Plot",
+                 plotOutput("energy_plot"),
+                 hr(),
+                 h4("Predicted Energy:"),
+                 verbatimTextOutput("predicted_energy")),
+        
+        tabPanel("Recommendations",
+                 h4("Parameter Recommendations:"),
+                 verbatimTextOutput("recommendations")),
+        
+        tabPanel("Data Preview",
+                 h4("Uploaded Data:"),
+                 tableOutput("data_preview")),
+        
+        tabPanel("Diagnostics",
+                 h4("Model Diagnostic Plots"),
+                 plotOutput("diagnostic_plot"))
+      )
+    )
+  )
+)
+
+# Server logic
+server <- function(input, output, session) {
+  
+  # checking to make sure that the csv has at least 17 columns
+  uploaded_data <- reactive({
+    req(input$datafile)
+    df <- read.csv(input$datafile$datapath, stringsAsFactors = FALSE)
+    validate(
+      need(ncol(df) >= 17, "CSV must have at least 17 columns.")
+    )
+    df
+  })
+  # populating the device dropdown with all options in the csv
+  observe({
+    req(uploaded_data())
+    devices <- unique(uploaded_data()[, 2])
+    updateSelectInput(session, "device", choices = devices, selected = devices[1])
+  })
+  
+  # populating the vessel dropdown with all options for that device in the csv
+  observe({
+    req(input$device, uploaded_data())
+    vessels <- unique(uploaded_data()[uploaded_data()[, 2] == input$device, 3])
+    updateSelectInput(session, "vessel", choices = vessels, selected = vessels[1])
+  })
+  
+  # storage variable for best-fit model
+  current_model <- reactiveVal(NULL)
+  
+  # ok this is where the math is happening
+  # when you click calculate: 
+  observeEvent(input$calculate, {
+    # filter dataset by device and vessel yippee!
+    req(input$device, input$vessel, uploaded_data())
+    
+    filtered <- uploaded_data()[uploaded_data()[, 2] == input$device & uploaded_data()[, 3] == input$vessel, ]
+    
+    # extract bp mode where device + vessel are true + convert to numeric
+    bp_mode <- as.numeric(filtered[, 10])
+    # extract energy (j) where device + vessel are true + convert to numeric
+    energy_j <- as.numeric(filtered[, 17])
+    # remove rows where bp_mode or energy_j are nas using valid variable
+    valid <- !is.na(bp_mode) & !is.na(energy_j)
+    bp_mode <- bp_mode[valid]
+    energy_j <- energy_j[valid]
+    
+    # create tidy dataframe with clean vectors
+    df_model <- data.frame(bp_mode = bp_mode, energy_j = energy_j)
+    # check: if there's not enough data to build the model, exit
+    # BP throw error here later
+    if (nrow(df_model) < 2) return()
+    
+    models <- list()
+    # poly2: fitting a 2nd degree polynomial model
+      # in math terms: Energy=B1*bp+B2*bp^2+B0
+    # raw = true means we're using true powers instead of orthogonal polynomials
+    models$poly2 <- lm(energy_j ~ poly(bp_mode, 2, raw = TRUE), data = df_model)
+    # if there's enough data, try a 3rd degree polynomial model
+    # i think these thresholds are too low; we can keep pushing this but 
+    # leaning towards the log transformations at the moment anyway
+    if(nrow(df_model) > 4) models$poly3 <- lm(energy_j ~ poly(bp_mode, 3, raw = TRUE), data = df_model)
+    # log linear: log(E) = B1*bp + B0
+    models$log_linear <- lm(log(energy_j) ~ bp_mode, data = df_model)
+    # power-law: log(E) = B1*log(bp) + B0
+    models$log_log <- lm(log(energy_j) ~ log(bp_mode), data = df_model)
+    # fitting a second degree polynomial to the log of energy
+    # equation: log(E) = B0 + B1*bp + B2*bp^2
+    models$log_poly2 <- lm(log(energy_j) ~ poly(bp_mode, 2, raw = TRUE), data = df_model)
+    
+    # fitting the polynomials using custom robust regression to minimize
+    # start with a quadratic fit, then iteratively downweight outliers
+    # essentially each loop -> lower weight for outliers
+    # may lead to overfitting issues in the future with more data
+    robust_fit <- function(x, y, max_iter = 20) {
+      fit <- lm(y ~ poly(x, 2, raw = TRUE))
+      for(i in 1:max_iter) {
+        res <- residuals(fit)
+        w <- 1 / (abs(res) + 0.1 * sd(res))
+        fit <- lm(y ~ poly(x, 2, raw = TRUE), weights = w)
+      }
+      fit
+    }
+    models$robust <- robust_fit(bp_mode, energy_j)
+    
+    # if we have enough data points (which we don't right now)
+    # could try a piecewise linear model; this is from chatgpt 
+    # so comments may be wrong but saving in case we need it later
+    # splits the data into two segments and loops over breakpoints
+    if(length(unique(bp_mode)) > 10) {
+      breakpoints <- quantile(bp_mode, probs = seq(0.2, 0.8, 0.1))
+      best_rse <- Inf
+      # fits the model of: E = B1 * bp * Iseg1 + B2 * bp * Iseg2 + Bo
+      for(bp in breakpoints) {
+        segment <- ifelse(bp_mode <= bp, 1, 2)
+        seg_df <- data.frame(bp_mode = bp_mode, energy_j = energy_j, segment = factor(segment))
+        model <- lm(energy_j ~ bp_mode * segment, data = seg_df)
+        # keep piecewise model with lowest RSE + store breakpoint
+        if(summary(model)$sigma < best_rse) {
+          best_rse <- summary(model)$sigma
+          best_model <- model
+          attr(best_model, "breakpoint") <- bp
+        }
+      }
+      models$piecewise <- best_model
+    }
+    
+    # new table for model metrics
+    comparison <- data.frame(
+      model = names(models),
+      # residual standard error, tells us the avg distance between
+      # the observed values + values predicted
+      rse = sapply(models, function(m) summary(m)$sigma),
+      # adjusted R^2, high numbers tell us we're capturing the 
+      # variation of the model
+      adj_r2 = sapply(models, function(m) summary(m)$adj.r.squared),
+      # aic: estimates our predictor error, lower is better
+      aic = sapply(models, AIC),
+      stringsAsFactors = FALSE
+    )
+    
+    # sort by rse bc i'm not worried about overfitting at this point,
+    # + we're trying to stay within the range so prediction not 
+    # super important
+    comparison <- comparison[order(comparison$rse), ]
+    # woohoo we found the best model! grab it
+    best_model_name <- comparison$model[1]
+    best_model <- models[[best_model_name]]
+    # store attributes w/ metadata
+    attr(best_model, "model_type") <- best_model_name
+    attr(best_model, "comparison") <- comparison
+    attr(best_model, "bp_data") <- bp_mode
+    attr(best_model, "energy_data") <- energy_j
+    # save to a reactive value for other outputs
+    current_model(best_model)
+  })
+  
+  # spitting out the outputs for the chosen model + all others
+  output$model_stats <- renderPrint({
+    req(current_model())
+    model <- current_model()
+    
+    cat("Selected Model Type:", attr(model, "model_type"), "\n\n")
+    cat("R-squared:", summary(model)$r.squared, "\n")
+    cat("Adjusted R-squared:", summary(model)$adj.r.squared, "\n")
+    cat("Residual Standard Error:", summary(model)$sigma, "\n\n")
+    cat("Coefficients:\n")
+    print(coef(model))
+    cat("\nModel Comparison:\n")
+    print(attr(model, "comparison"))
+  })
+  
+  # displaying a visual output of the chosen model w/ datapoints
+  output$energy_plot <- renderPlot({
+    req(current_model(), uploaded_data())
+    # filtering out raw data points to put on graph
+    filtered <- uploaded_data()[uploaded_data()[, 2] == input$device & uploaded_data()[, 3] == input$vessel, ]
+    bp_mode <- as.numeric(filtered[, 10])
+    energy_j <- as.numeric(filtered[, 17])
+    
+    valid <- !is.na(bp_mode) & !is.na(energy_j)
+    bp_mode <- bp_mode[valid]
+    energy_j <- energy_j[valid]
+    
+    # plotting raw datapoints in blue
+    plot(bp_mode, energy_j, main = "Energy vs Base Pair",
+         xlab = "Base Pair (bp)", ylab = "Energy (J)",
+         pch = 19, col = "blue")
+    
+    bp_seq <- seq(min(bp_mode), max(bp_mode), length.out = 100)
+    model <- current_model()
+    model_type <- attr(model, "model_type")
+    
+    if(model_type == "piecewise") {
+      bp <- bp_seq
+      breakpoint <- attr(model, "breakpoint")
+      segment <- ifelse(bp <= breakpoint, 1, 2)
+      pred <- predict(model, newdata = data.frame(bp_mode = bp, segment = factor(segment)))
+    } else {
+      pred <- predict(model, newdata = data.frame(bp_mode = bp_seq))
+    }
+    # plotting the predicted energy curve
+    lines(bp_seq, pred, col = "red", lwd = 2)
+    # line @ target bp
+    abline(v = input$target_bp, col = "green", lty = 2, lwd = 2)
+  })
+  
+  # shows a diagnostic plot for more advanced users to check how the model looks
+  output$diagnostic_plot <- renderPlot({
+    req(current_model())
+    model <- current_model()
+    # spacing
+    par(mfrow = c(2, 2))
+    # residuals v fitted: checks linearity + homoscedasticity
+    # checking for random scattering around 0, no patterns
+    plot(fitted(model), residuals(model), main = "Residuals vs Fitted")
+    abline(h = 0, col = "red", lty = 2)
+    # qq plot: checking for normal distribution of residuals
+    # points follow a 45 degree straight line (some deviation ok)
+    qqnorm(residuals(model)); qqline(residuals(model), col = "red")
+    # residuals vs fitted; plots sqrt(residuals) vs fitted values
+    # want to see fuzzy horizontal band here if transformations work correctly
+    plot(fitted(model), sqrt(abs(residuals(model))), main = "Residuals vs Fitted")
+    # residuals v base pair, custom for this graph
+    # want to see random scattering around 0
+    plot(attr(model, "bp_data"), residuals(model), main = "Residuals vs BP")
+    abline(h = 0, col = "red", lty = 2)
+    par(mfrow = c(1, 1))
+  })
+  
+  # calculates the predicted energy using input$target_bp
+  # reports predictions and model
+  output$predicted_energy <- renderText({
+    req(current_model())
+    model <- current_model()
+    model_type <- attr(model, "model_type")
+    bp <- input$target_bp
+    
+    pred <- if(model_type %in% c("log_linear", "log_poly2", "log_log", "power", "exp")) {
+      exp(predict(model, newdata = data.frame(bp_mode = bp)))
+    } else if(model_type == "piecewise") {
+      segment <- ifelse(bp <= attr(model, "breakpoint"), 1, 2)
+      predict(model, newdata = data.frame(bp_mode = bp, segment = factor(segment)))
+    } else {
+      predict(model, newdata = data.frame(bp_mode = bp))
+    }
+    
+    paste("For target BP of", bp, "bp:", round(pred, 2), "J", "(Model:", model_type, ")")
+  })
+  
+  # suggests PIP + Duration with a fixed DF + CPB
+  # THIS IS PROBABLY WRONG I NEED HELP HERE
+  output$recommendations <- renderText({
+    req(current_model())
+    pred <- predict(current_model(), newdata = data.frame(bp_mode = input$target_bp))
+    paste0(
+      "Target Energy: ", round(pred, 2), " J\n\n",
+      "Suggested Parameters:\n",
+      "- Peak Incident Power: ", round(pred / 10, 1), " W\n",
+      "- Duration: ", round(pred / 5), " seconds\n",
+      "- Duty Factor: 10%\n",
+      "- Cycles per Burst: 200\n\n",
+      "Note: Refine parameters based on experience and protocol requirements."
+    )
+  })
+  
+  # sanity check that correct data was uploaded
+  output$data_preview <- renderTable({
+    req(uploaded_data())
+    head(uploaded_data(), 10)
+  })
+}
+
+# launch the app! yippee!
+shinyApp(ui = ui, server = server)
