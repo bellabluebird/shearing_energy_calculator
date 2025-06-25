@@ -1,354 +1,374 @@
-# DNA Shearing Energy Calculator
-# this version uses only base R and shiny (no other packages required)
-
-# user selection screen
-# dropdown: select device (col B)
-# dropdown: select from vessels available on this device (col C)
-# dropdown: select target BP shearing via a slider
-
+# dna shearing energy calculator v3
+# this version uses only base r and shiny (no other packages required)
+#
+# models included (based on previous testing):
+# - log_linear: E = exp(a + b*bp) - exponential growth
+# - log_poly2: E = exp(a + b*bp + c*bp²)
+# - log_poly3: E = exp(a + b*bp + c*bp² + d*bp³)
+# - power: E = a * bp^b - classic power law
+# - poly4: E = a + b*bp + c*bp² + d*bp³ + e*bp⁴
+#
 # my hypothesis is that we can effectively calculate the total energy input 
 # required to shear to a target base pair based on the instrument and 
 # consumable that a customer is using. We have data for the amount of energy
 # required to shear to a few different measurements, but I want to find
 # intermediaries and special cases.
-
-# I'm drawing from:
-# Available protocols on the Covaris website
-# Julie's doc (DNA Shearing Protocols Sept 2020)
-# Anything else?
-
+#
 # after graphing the energy input (J), we can figure out how to adjust other
-# paramaters to get to that number while preserving quality of the sample
+# parameters to get to that number while preserving quality of the sample
 # and keeping time relatively low. I'm not sure what the most effective way
 # to do this & I'll need help from other team members on what they've
 # seen in the past. I'm not tackling this until later but I added the view
 # and some fake math to make our lives easier in the future.
-
+#
 # what should be happening under the hood:
-# identifying the best model for different devices/vessels
-# creating individual equations to model Energy (J) (col Q)
-# to Base Pair Mode (bp) (col J) for each Vessel (col C) and storing
-# those equations in a new dataframe. Give other statistics to indicate 
-# model accuracy.
-
+# - fits multiple model types to energy vs base pair data, selects using AIC
+# - creates individual equations to model Energy (J) (col Q)
+#   to Base Pair Mode (bp) (col J) for each Vessel (col C) and storing
+#   those equations in a new dataframe. 
+# - provides confidence + prediction intervals
+# - enables the export of equations + protocols *coming soon*
+#
 # what the user should be able to see:
-# visual graphs of the equations above
-# recommendations
+# - visual graphs of the equations above
+# - recommendations for settings + protocols
+# - accuracy warnings when necessary
 
 library(shiny)
 
-# Define UI
+# define ui for application
 ui <- fluidPage(
-  titlePanel("DNA Shearing Energy Calculator v1"),
+  # app title
+  titlePanel("DNA Shearing Energy Calculator v3"),
   
-  # setting up the gui
+  # sidebar with controls
   sidebarLayout(
     sidebarPanel(
-      fileInput("datafile", "Choose CSV File", accept = c(".csv")),
-      helpText("CSV should have at least 17 columns:",
-               "Column 2 = Device, Column 3 = Vessel,",
+      # file upload widget
+      fileInput("datafile", 
+                "Choose CSV File", 
+                accept = c(".csv")),
+      
+      # help text for users
+      helpText("Column 2 = Device, Column 3 = Vessel,",
                "Column 10 = Base Pair (bp), Column 17 = Energy (J)"),
       
-      hr(),
-      selectInput("device", "Select Device:", choices = list("Upload data first" = ""), selected = ""),
-      selectInput("vessel", "Select Vessel:", choices = list("Select device first" = ""), selected = ""),
-      sliderInput("target_bp", "Target Base Pair (bp):", min = 50, max = 5000, value = 500, step = 50),
-      actionButton("calculate", "Calculate Energy"),
+      hr(), # horizontal line
       
+      # device selection dropdown
+      selectInput("device", 
+                  "Select Device:", 
+                  choices = list("Upload data first" = ""), 
+                  selected = ""),
+      
+      # vessel selection dropdown
+      selectInput("vessel", 
+                  "Select Vessel:", 
+                  choices = list("Select device first" = ""), 
+                  selected = ""),
+      
+      # target bp slider
+      sliderInput("target_bp", 
+                  "Target Base Pair (bp):", 
+                  min = 50, 
+                  max = 1000, 
+                  value = 500, 
+                  step = 50),
+      
+      actionButton("calculate", "Calculate Energy"),
       hr(),
+      
+      # model statistics display
       h4("Model Statistics"),
       verbatimTextOutput("model_stats")
     ),
     
+    # main panel with tabs
     mainPanel(
       tabsetPanel(
+        # main plot tab
         tabPanel("Energy vs Base Pair Plot",
                  plotOutput("energy_plot"),
                  hr(),
                  h4("Predicted Energy:"),
                  verbatimTextOutput("predicted_energy")),
         
+        # recommendations tab
         tabPanel("Recommendations",
                  h4("Parameter Recommendations:"),
                  verbatimTextOutput("recommendations")),
         
+        # data preview tab
         tabPanel("Data Preview",
-                 h4("Uploaded Data:"),
+                 h4("Uploaded Data (First 10 Rows):"),
                  tableOutput("data_preview")),
         
+        # diagnostics tab
         tabPanel("Diagnostics",
                  h4("Model Diagnostic Plots"),
-                 plotOutput("diagnostic_plot")),
+                 plotOutput("diagnostic_plot"),
+                 hr(),
+                 h4("Improvement Suggestions:"),
+                 verbatimTextOutput("improvement_suggestions")),
         
-        tabPanel("Model Equations",
+        # all equations tab
+        tabPanel("All Equations",
                  h4("Summary Statistics"),
                  verbatimTextOutput("equation_summary"),
                  hr(),
-                 h4("Log-Poly2 Model Coefficients for All Device-Vessel Combinations"),
-                 tableOutput("log_poly2_table"),
-                 downloadButton("download_log_poly2", "Download All Log-Poly2 Equations"),
+                 h4("Best Model for Each Device-Vessel Combination"),
+                 tableOutput("all_equations_table"),
+                 downloadButton("download_equations", "Download All Equations"),
                  hr(),
-                 h4("Example Log-Poly2 Curves (First 4)"),
-                 plotOutput("log_poly2_plot"))
+                 h4("Example Model Curves (Up to 4 Different Types)"),
+                 plotOutput("example_curves"))
       )
     )
   )
 )
 
-# Server logic
+# define server logic
 server <- function(input, output, session) {
   
-  # checking to make sure that the csv has at least 17 columns
+  # reactive value to store uploaded data
   uploaded_data <- reactive({
     req(input$datafile)
+    
+    # read csv file
     df <- read.csv(input$datafile$datapath, stringsAsFactors = FALSE)
+    
+    # validate that we have enough columns
     validate(
       need(ncol(df) >= 17, "CSV must have at least 17 columns.")
     )
+    
     df
   })
-  # automatically calculate log_poly2 models for all device/vessel combinations
-  all_equations <- reactive({
-    req(uploaded_data())
-    
-    # get all unique device/vessel combinations
-    data <- uploaded_data()
-    unique_combos <- unique(data[, c(2, 3)])  # columns 2 and 3
-    colnames(unique_combos) <- c("device", "vessel")
-    
-    # initialize empty list to store results
-    results_list <- list()
-    
-    # loop through each combination
-    for(i in 1:nrow(unique_combos)) {
-      device <- unique_combos$device[i]
-      vessel <- unique_combos$vessel[i]
-      
-      # filter data for this combination
-      filtered <- data[data[, 2] == device & data[, 3] == vessel, ]
-      
-      # extract bp and energy values
-      bp_mode <- as.numeric(filtered[, 10])
-      energy_j <- as.numeric(filtered[, 17])
-      
-      # remove NAs
-      valid <- !is.na(bp_mode) & !is.na(energy_j) & energy_j > 0 & bp_mode > 0
-      bp_mode <- bp_mode[valid]
-      energy_j <- energy_j[valid]
-      
-      # skip if not enough data points
-      if(length(bp_mode) < 3) {
-        results_list[[i]] <- data.frame(
-          device = device,
-          vessel = vessel,
-          n_points = length(bp_mode),
-          intercept = NA,
-          bp_coef = NA,
-          bp2_coef = NA,
-          r_squared = NA,
-          adj_r_squared = NA,
-          rse = NA,
-          bp_min = NA,
-          bp_max = NA,
-          status = "insufficient data"
-        )
-        next
-      }
-      # try to fit log_poly2 model
-      tryCatch({
-        # fit the model: log(energy) = b0 + b1*bp + b2*bp^2
-        model <- lm(log(energy_j) ~ poly(bp_mode, 2, raw = TRUE))
-        
-        # extract coefficients
-        coefs <- coef(model)
-        
-        # get model statistics
-        model_summary <- summary(model)
-        
-        # store results
-        results_list[[i]] <- data.frame(
-          device = device,
-          vessel = vessel,
-          n_points = length(bp_mode),
-          intercept = coefs[1],
-          bp_coef = coefs[2],
-          bp2_coef = coefs[3],
-          r_squared = model_summary$r.squared,
-          adj_r_squared = model_summary$adj.r.squared,
-          rse = model_summary$sigma,
-          bp_min = min(bp_mode),
-          bp_max = max(bp_mode),
-          status = "success"
-        )
-      }, error = function(e) {
-        # if model fails, store NA values
-        results_list[[i]] <- data.frame(
-          device = device,
-          vessel = vessel,
-          n_points = length(bp_mode),
-          intercept = NA,
-          bp_coef = NA,
-          bp2_coef = NA,
-          r_squared = NA,
-          adj_r_squared = NA,
-          rse = NA,
-          bp_min = min(bp_mode),
-          bp_max = max(bp_mode),
-          status = paste("error:", e$message)
-        )
-      })
-    }
-    # combine all results into one dataframe
-    do.call(rbind, results_list)
-  })
   
-  # populating the device dropdown with all options in the csv
+  # update device dropdown when data is uploaded
   observe({
     req(uploaded_data())
+    
+    # get unique devices from column 2
     devices <- unique(uploaded_data()[, 2])
-    updateSelectInput(session, "device", choices = devices, selected = devices[1])
+    
+    # update the dropdown
+    updateSelectInput(session, "device", 
+                      choices = devices, 
+                      selected = devices[1])
   })
   
-  # populating the vessel dropdown with all options for that device in the csv
+  # update vessel dropdown based on selected device
   observe({
     req(input$device, uploaded_data())
-    vessels <- unique(uploaded_data()[uploaded_data()[, 2] == input$device, 3])
-    updateSelectInput(session, "vessel", choices = vessels, selected = vessels[1])
+    
+    # filter for selected device and get vessels from column 3
+    device_data <- uploaded_data()[uploaded_data()[, 2] == input$device, ]
+    vessels <- unique(device_data[, 3])
+    
+    # update the dropdown
+    updateSelectInput(session, "vessel", 
+                      choices = vessels, 
+                      selected = vessels[1])
   })
   
-  # storage variable for best-fit model
+  # reactive value to store the current model
   current_model <- reactiveVal(NULL)
-  # it seems like log_poly2 is the best across the board, let's
-  # make a dataframe to store all equations for each vessel
-  all_log_poly2_models <- reactiveVal(data.frame())
   
-  # model selection
-  # when you click calculate: 
+  # calculate energy when button is clicked
   observeEvent(input$calculate, {
-    # filter dataset by device and vessel yippee!
     req(input$device, input$vessel, uploaded_data())
     
-    filtered <- uploaded_data()[uploaded_data()[, 2] == input$device & uploaded_data()[, 3] == input$vessel, ]
+    # filter data for selected device and vessel
+    filtered <- uploaded_data()[
+      uploaded_data()[, 2] == input$device & 
+        uploaded_data()[, 3] == input$vessel, 
+    ]
     
-    # extract bp mode where device + vessel are true + convert to numeric
+    # extract bp (column 10) and energy (column 17)
     bp_mode <- as.numeric(filtered[, 10])
-    # extract energy (j) where device + vessel are true + convert to numeric
     energy_j <- as.numeric(filtered[, 17])
-    # remove rows where bp_mode or energy_j are nas using valid variable
-    valid <- !is.na(bp_mode) & !is.na(energy_j)
+    
+    # remove nas and invalid values
+    # we need positive values for log transformations
+    valid <- !is.na(bp_mode) & !is.na(energy_j) & energy_j > 0 & bp_mode > 0
     bp_mode <- bp_mode[valid]
     energy_j <- energy_j[valid]
     
-    # create tidy dataframe with clean vectors
+    # create clean dataframe for modeling
     df_model <- data.frame(bp_mode = bp_mode, energy_j = energy_j)
-    # check: if there's not enough data to build the model, exit
-    # BP throw error here later
-    if (nrow(df_model) < 2) return()
     
+    # check if we have enough data
+    if (nrow(df_model) < 3) {
+      showNotification("Insufficient data for modeling (need at least 3 points)", type = "error")
+      return()
+    }
+    
+    # fit multiple model types - focusing on log-transformed and power models
+    # these models work well for dna shearing energy because:
+    # - energy often follows exponential/power relationships with bp
+    # - log transformation handles multiplicative errors common in energy measurements
+    # - these models respect the physical constraint that energy > 0
     models <- list()
-    # poly2: fitting a 2nd degree polynomial model
-      # in math terms: Energy=B1*bp+B2*bp^2+B0
-    # raw = true means we're using true powers instead of orthogonal polynomials
-    models$poly2 <- lm(energy_j ~ poly(bp_mode, 2, raw = TRUE), data = df_model)
-    # if there's enough data, try a 3rd degree polynomial model
-    # i think these thresholds are too low; we can keep pushing this but 
-    # leaning towards the log transformations at the moment anyway
-    if(nrow(df_model) > 4) models$poly3 <- lm(energy_j ~ poly(bp_mode, 3, raw = TRUE), data = df_model)
-    # log linear: log(E) = B1*bp + B0
+    
+    # log-transformed models (energy must be positive)
+    # log-linear: log(e) = a + b*bp (exponential relationship)
     models$log_linear <- lm(log(energy_j) ~ bp_mode, data = df_model)
-    # power-law: log(E) = B1*log(bp) + B0
-    models$log_log <- lm(log(energy_j) ~ log(bp_mode), data = df_model)
-    # fitting a second degree polynomial to the log of energy
-    # equation: log(E) = B0 + B1*bp + B2*bp^2
+    
+    # log-polynomial: log(e) = a + b*bp + c*bp^2
     models$log_poly2 <- lm(log(energy_j) ~ poly(bp_mode, 2, raw = TRUE), data = df_model)
     
-    # fitting the polynomials using custom robust regression to minimize
-    # start with a quadratic fit, then iteratively downweight outliers
-    # essentially each loop -> lower weight for outliers
-    # may lead to overfitting issues in the future with more data
-    robust_fit <- function(x, y, max_iter = 20) {
-      fit <- lm(y ~ poly(x, 2, raw = TRUE))
-      for(i in 1:max_iter) {
-        res <- residuals(fit)
-        w <- 1 / (abs(res) + 0.1 * sd(res))
-        fit <- lm(y ~ poly(x, 2, raw = TRUE), weights = w)
-      }
-      fit
-    }
-    models$robust <- robust_fit(bp_mode, energy_j)
-    
-    # if we have enough data points (which we don't right now)
-    # could try a piecewise linear model; this is from chatgpt 
-    # so comments may be wrong but saving in case we need it later
-    # splits the data into two segments and loops over breakpoints
-    if(length(unique(bp_mode)) > 10) {
-      breakpoints <- quantile(bp_mode, probs = seq(0.2, 0.8, 0.1))
-      best_rse <- Inf
-      # fits the model of: E = B1 * bp * Iseg1 + B2 * bp * Iseg2 + Bo
-      for(bp in breakpoints) {
-        segment <- ifelse(bp_mode <= bp, 1, 2)
-        seg_df <- data.frame(bp_mode = bp_mode, energy_j = energy_j, segment = factor(segment))
-        model <- lm(energy_j ~ bp_mode * segment, data = seg_df)
-        # keep piecewise model with lowest RSE + store breakpoint
-        if(summary(model)$sigma < best_rse) {
-          best_rse <- summary(model)$sigma
-          best_model <- model
-          attr(best_model, "breakpoint") <- bp
-        }
-      }
-      models$piecewise <- best_model
+    # higher order log-polynomial if enough data
+    if(nrow(df_model) > 5) {
+      models$log_poly3 <- lm(log(energy_j) ~ poly(bp_mode, 3, raw = TRUE), data = df_model)
     }
     
-    # new table for model metrics
+    # power law: e = a * bp^b (linearized as log(e) = log(a) + b*log(bp))
+    models$power <- lm(log(energy_j) ~ log(bp_mode), data = df_model)
+    
+    # polynomial degree 4 only if we have sufficient data (at least 7 points)
+    if(nrow(df_model) > 7) {
+      models$poly4 <- lm(energy_j ~ poly(bp_mode, 4, raw = TRUE), data = df_model)
+    }
+    
+    # compare models using aic (lower is better)
     comparison <- data.frame(
       model = names(models),
-      # residual standard error, tells us the avg distance between
-      # the observed values + values predicted
-      rse = sapply(models, function(m) summary(m)$sigma),
-      # adjusted R^2, high numbers tell us we're capturing the 
-      # variation of the model
-      adj_r2 = sapply(models, function(m) summary(m)$adj.r.squared),
-      # aic: estimates our predictor error, lower is better
       aic = sapply(models, AIC),
+      bic = sapply(models, BIC),
+      rse = sapply(models, function(m) summary(m)$sigma),
+      adj_r2 = sapply(models, function(m) summary(m)$adj.r.squared),
+      df = sapply(models, function(m) length(coef(m))),
       stringsAsFactors = FALSE
     )
     
-    # sort by rse bc i'm not worried about overfitting at this point,
-    # + we're trying to stay within the range so prediction not 
-    # super important
-    comparison <- comparison[order(comparison$rse), ]
-    # woohoo we found the best model! grab it
+    # remove any models with invalid metrics (can happen with perfect fits or singular matrices)
+    comparison <- comparison[!is.na(comparison$aic) & !is.infinite(comparison$aic), ]
+    
+    # calculate corrected aic for small samples
+    n <- nrow(df_model)
+    comparison$aicc <- comparison$aic + (2 * comparison$df * (comparison$df + 1)) / (n - comparison$df - 1)
+    
+    # sort by aic to find best model
+    comparison <- comparison[order(comparison$aic), ]
+    
+    # select best model (lowest aic)
     best_model_name <- comparison$model[1]
     best_model <- models[[best_model_name]]
-    # store attributes w/ metadata
+    
+    # store metadata with the model
     attr(best_model, "model_type") <- best_model_name
     attr(best_model, "comparison") <- comparison
     attr(best_model, "bp_data") <- bp_mode
     attr(best_model, "energy_data") <- energy_j
-    # save to a reactive value for other outputs
+    attr(best_model, "data_range") <- c(min(bp_mode), max(bp_mode))
+    
+    # save the model
     current_model(best_model)
   })
   
-  # spitting out the outputs for the chosen model + all others
+  # function to predict with confidence and prediction intervals
+  predict_with_intervals <- function(model, new_bp, level = 0.95) {
+    model_type <- attr(model, "model_type")
+    
+    # create prediction dataframe
+    pred_df <- data.frame(bp_mode = new_bp)
+    
+    # handle different model types
+    if(model_type %in% c("log_linear", "log_poly2", "log_poly3", "exp")) {
+      # for log models, predict on log scale then back-transform
+      log_conf <- predict(model, newdata = pred_df, interval = "confidence", level = level)
+      log_pred <- predict(model, newdata = pred_df, interval = "prediction", level = level)
+      
+      # exponentiate to get back to original scale
+      result <- list(
+        fit = exp(log_conf[, "fit"]),
+        conf_lower = exp(log_conf[, "lwr"]),
+        conf_upper = exp(log_conf[, "upr"]),
+        pred_lower = exp(log_pred[, "lwr"]),
+        pred_upper = exp(log_pred[, "upr"])
+      )
+    } else if(model_type == "power") {
+      # power law also needs back-transformation
+      log_conf <- predict(model, newdata = data.frame(bp_mode = new_bp), interval = "confidence", level = level)
+      log_pred <- predict(model, newdata = data.frame(bp_mode = new_bp), interval = "prediction", level = level)
+      
+      result <- list(
+        fit = exp(log_conf[, "fit"]),
+        conf_lower = exp(log_conf[, "lwr"]),
+        conf_upper = exp(log_conf[, "upr"]),
+        pred_lower = exp(log_pred[, "lwr"]),
+        pred_upper = exp(log_pred[, "upr"])
+      )
+    } else if(model_type %in% c("sqrt", "sqrt_poly2")) {
+      # square root models need squaring
+      sqrt_conf <- predict(model, newdata = pred_df, interval = "confidence", level = level)
+      sqrt_pred <- predict(model, newdata = pred_df, interval = "prediction", level = level)
+      
+      # square to get back to original scale, ensure non-negative
+      result <- list(
+        fit = sqrt_conf[, "fit"]^2,
+        conf_lower = pmax(0, sqrt_conf[, "lwr"])^2,
+        conf_upper = sqrt_conf[, "upr"]^2,
+        pred_lower = pmax(0, sqrt_pred[, "lwr"])^2,
+        pred_upper = sqrt_pred[, "upr"]^2
+      )
+    } else {
+      # standard models (poly2, poly3, inverse, etc)
+      conf <- predict(model, newdata = pred_df, interval = "confidence", level = level)
+      pred <- predict(model, newdata = pred_df, interval = "prediction", level = level)
+      
+      result <- list(
+        fit = conf[, "fit"],
+        conf_lower = conf[, "lwr"],
+        conf_upper = conf[, "upr"],
+        pred_lower = pred[, "lwr"],
+        pred_upper = pred[, "upr"]
+      )
+    }
+    
+    result
+  }
+  
+  # display model statistics
   output$model_stats <- renderPrint({
     req(current_model())
     model <- current_model()
     
-    cat("Selected Model Type:", attr(model, "model_type"), "\n\n")
-    cat("R-squared:", summary(model)$r.squared, "\n")
-    cat("Adjusted R-squared:", summary(model)$adj.r.squared, "\n")
-    cat("Residual Standard Error:", summary(model)$sigma, "\n\n")
-    cat("Coefficients:\n")
+    cat("SELECTED MODEL (lowest AIC):", attr(model, "model_type"), "\n\n")
+    cat("Model Quality Metrics:\n")
+    cat("AIC:", round(AIC(model), 2), "\n")
+    cat("BIC:", round(BIC(model), 2), "\n")
+    cat("R-squared:", round(summary(model)$r.squared, 4), "\n")
+    cat("Adjusted R-squared:", round(summary(model)$adj.r.squared, 4), "\n")
+    cat("Residual Standard Error:", round(summary(model)$sigma, 2), "\n")
+    cat("Sample Size:", length(attr(model, "bp_data")), "\n")
+    cat("Data Range:", round(attr(model, "data_range")[1]), "-", round(attr(model, "data_range")[2]), "bp\n")
+    
+    cat("\nCoefficients:\n")
     print(coef(model))
-    cat("\nModel Comparison:\n")
-    print(attr(model, "comparison"))
+    
+    cat("\n--- MODEL COMPARISON (sorted by AIC) ---\n")
+    comparison <- attr(model, "comparison")
+    # add delta aic column
+    comparison$delta_aic <- comparison$aic - min(comparison$aic)
+    print(comparison[, c("model", "aic", "delta_aic", "adj_r2", "rse")])
+    
+    cat("\nInterpretation:\n")
+    cat("Models with ΔAIC < 2 have substantial support\n")
+    cat("Models with ΔAIC > 10 have essentially no support\n")
+    cat("Log-transformed models often perform best for DNA shearing data\n")
   })
   
-  # displaying a visual output of the chosen model w/ datapoints
+  # create energy vs base pair plot with intervals
   output$energy_plot <- renderPlot({
     req(current_model(), uploaded_data())
-    # filtering out raw data points to put on graph
-    filtered <- uploaded_data()[uploaded_data()[, 2] == input$device & uploaded_data()[, 3] == input$vessel, ]
+    
+    # get the data points
+    filtered <- uploaded_data()[
+      uploaded_data()[, 2] == input$device & 
+        uploaded_data()[, 3] == input$vessel, 
+    ]
     bp_mode <- as.numeric(filtered[, 10])
     energy_j <- as.numeric(filtered[, 17])
     
@@ -356,200 +376,504 @@ server <- function(input, output, session) {
     bp_mode <- bp_mode[valid]
     energy_j <- energy_j[valid]
     
-    # plotting raw datapoints in blue
-    plot(bp_mode, energy_j, main = "Energy vs Base Pair",
-         xlab = "Base Pair (bp)", ylab = "Energy (J)",
-         pch = 19, col = "blue")
-    
+    # create sequence for smooth curves
     bp_seq <- seq(min(bp_mode), max(bp_mode), length.out = 100)
     model <- current_model()
-    model_type <- attr(model, "model_type")
     
-    if(model_type == "piecewise") {
-      bp <- bp_seq
-      breakpoint <- attr(model, "breakpoint")
-      segment <- ifelse(bp <= breakpoint, 1, 2)
-      pred <- predict(model, newdata = data.frame(bp_mode = bp, segment = factor(segment)))
-    } else {
-      pred <- predict(model, newdata = data.frame(bp_mode = bp_seq))
-    }
-    # plotting the predicted energy curve
-    lines(bp_seq, pred, col = "red", lwd = 2)
-    # line @ target bp
+    # get predictions with intervals
+    preds <- predict_with_intervals(model, bp_seq)
+    
+    # determine y-axis range to include intervals
+    y_range <- range(c(energy_j, preds$pred_upper, preds$pred_lower), na.rm = TRUE)
+    
+    # create the plot
+    plot(bp_mode, energy_j, 
+         main = paste("Energy vs Base Pair -", attr(model, "model_type"), "model"),
+         xlab = "Base Pair (bp)", 
+         ylab = "Energy (J)",
+         pch = 19, 
+         col = "blue",
+         ylim = y_range)
+    
+    # add prediction interval (95% of new observations will fall here)
+    polygon(c(bp_seq, rev(bp_seq)), 
+            c(preds$pred_lower, rev(preds$pred_upper)),
+            col = rgb(0.8, 0.8, 0.8, 0.3), 
+            border = NA)
+    
+    # add confidence interval (95% confidence in the mean)
+    polygon(c(bp_seq, rev(bp_seq)), 
+            c(preds$conf_lower, rev(preds$conf_upper)),
+            col = rgb(0.5, 0.5, 0.5, 0.5), 
+            border = NA)
+    
+    # add fitted line
+    lines(bp_seq, preds$fit, col = "red", lwd = 2)
+    
+    # add target bp line
     abline(v = input$target_bp, col = "green", lty = 2, lwd = 2)
+    
+    # check if extrapolating
+    data_range <- attr(model, "data_range")
+    if(input$target_bp < data_range[1] || input$target_bp > data_range[2]) {
+      # add warning text
+      text(input$target_bp, max(y_range) * 0.9, 
+           "EXTRAPOLATION\nWARNING", 
+           col = "red", 
+           font = 2,
+           pos = 4)
+    }
+    
+    # add legend
+    legend("topright", 
+           legend = c("Data", "Fitted", "95% Confidence", "95% Prediction", "Target BP"),
+           col = c("blue", "red", rgb(0.5, 0.5, 0.5, 0.5), rgb(0.8, 0.8, 0.8, 0.3), "green"),
+           pch = c(19, NA, NA, NA, NA),
+           lty = c(NA, 1, NA, NA, 2),
+           lwd = c(NA, 2, NA, NA, 2),
+           fill = c(NA, NA, rgb(0.5, 0.5, 0.5, 0.5), rgb(0.8, 0.8, 0.8, 0.3), NA))
   })
   
-  # shows a diagnostic plot for more advanced users to check how the model looks
-  output$diagnostic_plot <- renderPlot({
-    req(current_model())
-    model <- current_model()
-    # spacing
-    par(mfrow = c(2, 2))
-    # residuals v fitted: checks linearity + homoscedasticity
-    # checking for random scattering around 0, no patterns
-    plot(fitted(model), residuals(model), main = "Residuals vs Fitted")
-    abline(h = 0, col = "red", lty = 2)
-    # qq plot: checking for normal distribution of residuals
-    # points follow a 45 degree straight line (some deviation ok)
-    qqnorm(residuals(model)); qqline(residuals(model), col = "red")
-    # residuals vs fitted; plots sqrt(residuals) vs fitted values
-    # want to see fuzzy horizontal band here if transformations work correctly
-    plot(fitted(model), sqrt(abs(residuals(model))), main = "Residuals vs Fitted")
-    # residuals v base pair, custom for this graph
-    # want to see random scattering around 0
-    plot(attr(model, "bp_data"), residuals(model), main = "Residuals vs BP")
-    abline(h = 0, col = "red", lty = 2)
-    par(mfrow = c(1, 1))
-  })
-  
-  # calculates the predicted energy using input$target_bp
-  # reports predictions and model
+  # display predicted energy with intervals
   output$predicted_energy <- renderText({
     req(current_model())
+    
     model <- current_model()
-    model_type <- attr(model, "model_type")
     bp <- input$target_bp
     
-    pred <- if(model_type %in% c("log_linear", "log_poly2", "log_log", "power", "exp")) {
-      exp(predict(model, newdata = data.frame(bp_mode = bp)))
-    } else if(model_type == "piecewise") {
-      segment <- ifelse(bp <= attr(model, "breakpoint"), 1, 2)
-      predict(model, newdata = data.frame(bp_mode = bp, segment = factor(segment)))
-    } else {
-      predict(model, newdata = data.frame(bp_mode = bp))
+    # get prediction with intervals
+    pred <- predict_with_intervals(model, bp)
+    
+    # check if we're extrapolating
+    data_range <- attr(model, "data_range")
+    extrapolating <- bp < data_range[1] || bp > data_range[2]
+    
+    # format the output
+    output_text <- paste0(
+      "Model: ", attr(model, "model_type"), "\n",
+      "Target BP: ", bp, " bp\n\n",
+      "Point Estimate: ", round(pred$fit, 2), " J\n",
+      "95% Confidence Interval: [", round(pred$conf_lower, 2), ", ", round(pred$conf_upper, 2), "] J\n"
+    )
+    
+    # add warning if extrapolating
+    if(extrapolating) {
+      output_text <- paste0(
+        output_text,
+        "\n ⚠️ WARNING: Extrapolating outside data range. Predictions may be unreliable! \n",
+        "95% Prediction Interval: [", round(pred$pred_lower, 2), ", ", round(pred$pred_upper, 2), "] J\n\n"
+      )
     }
     
-    paste("For target BP of", bp, "bp:", round(pred, 2), "J", "(Model:", model_type, ")")
+    output_text
   })
   
-  # suggests PIP + Duration with a fixed DF + CPB
-  # THIS IS PROBABLY WRONG I NEED HELP HERE
+  # parameter recommendations
   output$recommendations <- renderText({
     req(current_model())
-    pred <- predict(current_model(), newdata = data.frame(bp_mode = input$target_bp))
+    
+    # get predicted energy
+    pred <- predict_with_intervals(current_model(), input$target_bp)
+    target_energy <- pred$fit
+    
+    # these are placeholder calculations - need domain expertise
     paste0(
-      "Target Energy: ", round(pred, 2), " J\n\n",
+      "Target Energy: ", round(target_energy, 2), " J\n",
+      "Range: [", round(pred$conf_lower, 2), " - ", round(pred$conf_upper, 2), "] J\n\n",
       "Suggested Parameters:\n",
-      "- Peak Incident Power: ", round(pred / 10, 1), " W\n",
-      "- Duration: ", round(pred / 5), " seconds\n",
+      "- Peak Incident Power: ", round(target_energy / 10, 1), " W\n",
+      "- Duration: ", round(target_energy / 5), " seconds\n",
       "- Duty Factor: 10%\n",
       "- Cycles per Burst: 200\n\n",
-      "Note: Refine parameters based on experience and protocol requirements."
+      "Note: These are preliminary suggestions.\n",
+      "Please refine based on:\n",
+      "- Device maximum power limits\n",
+      "- Sample quality requirements\n",
+      "- Processing time constraints\n",
+      "- Protocol validation results"
     )
   })
   
-  # sanity check that correct data was uploaded
+  # display data preview
   output$data_preview <- renderTable({
     req(uploaded_data())
     head(uploaded_data(), 10)
   })
   
-  # create example plots showing the first 4 equations
-  output$log_poly2_plot <- renderPlot({
+  # diagnostic plots
+  output$diagnostic_plot <- renderPlot({
+    req(current_model())
+    model <- current_model()
+    
+    # 2x2 layout for diagnostic plots
+    par(mfrow = c(2, 2))
+    
+    # 1. residuals vs fitted values
+    plot(fitted(model), residuals(model),
+         main = "Residuals vs Fitted",
+         xlab = "Fitted Values",
+         ylab = "Residuals")
+    abline(h = 0, col = "red", lty = 2)
+    
+    # 2. normal q-q plot
+    qqnorm(residuals(model), main = "Normal Q-Q Plot")
+    qqline(residuals(model), col = "red")
+    
+    # 3. scale-location plot
+    plot(fitted(model), sqrt(abs(residuals(model))),
+         main = "Scale-Location",
+         xlab = "Fitted Values",
+         ylab = "Sqrt(|Residuals|)")
+    
+    # 4. residuals vs base pair
+    bp_data <- attr(model, "bp_data")
+    plot(bp_data, residuals(model),
+         main = "Residuals vs Base Pair",
+         xlab = "Base Pair (bp)",
+         ylab = "Residuals")
+    abline(h = 0, col = "red", lty = 2)
+    
+    # reset layout
+    par(mfrow = c(1, 1))
+  })
+  
+  # improvement suggestions
+  output$improvement_suggestions <- renderText({
+    req(current_model())
+    
+    model <- current_model()
+    rse <- summary(model)$sigma
+    model_type <- attr(model, "model_type")
+    residuals <- residuals(model)
+    
+    suggestions <- paste(
+      "Current Model Type:", model_type,
+      "\nCurrent RSE:", round(rse, 2), "\n\n"
+    )
+    
+    # check for high rse
+    if(rse > 1000) {
+      suggestions <- paste(suggestions,
+                           "High RSE detected. Consider:\n",
+                           "1. Check for outliers in your data\n",
+                           "2. Verify units are consistent (J vs mJ vs kJ)\n",
+                           "3. Consider if there are subgroups in your data\n",
+                           "4. Check for data entry errors\n\n"
+      )
+    }
+    
+    # check for patterns in residuals
+    if(length(residuals) > 10) {
+      # simple test for heteroscedasticity
+      first_half <- residuals[1:floor(length(residuals)/2)]
+      second_half <- residuals[(floor(length(residuals)/2)+1):length(residuals)]
+      variance_ratio <- var(second_half) / var(first_half)
+      
+      if(variance_ratio > 2 || variance_ratio < 0.5) {
+        suggestions <- paste(suggestions,
+                             "Non-constant variance detected.\n",
+                             "The spread of residuals changes with bp value.\n",
+                             "Consider:\n",
+                             "- Weighted regression\n",
+                             "- Different model type\n",
+                             "- Separate models for different bp ranges\n\n"
+        )
+      }
+    }
+    
+    # check data coverage
+    bp_data <- attr(model, "bp_data")
+    bp_range <- max(bp_data) - min(bp_data)
+    if(bp_range < 1000) {
+      suggestions <- paste(suggestions,
+                           "Limited BP range in data (", round(min(bp_data)), "-", 
+                           round(max(bp_data)), " bp).\n",
+                           "Consider collecting more data across wider bp range.\n",
+                           "Current model may not extrapolate well.\n\n"
+      )
+    }
+    
+    # model-specific suggestions
+    if(model_type == "poly4" && rse > 500) {
+      suggestions <- paste(suggestions,
+                           "High-degree polynomial may be overfitting.\n",
+                           "Consider if log-transformed models (log_linear, log_poly2)\n",
+                           "might better capture the exponential nature of energy-bp relationship.\n"
+      )
+    }
+    
+    if(model_type == "power" && any(bp_data < 100)) {
+      suggestions <- paste(suggestions,
+                           "Power law model with very low bp values can be unstable.\n",
+                           "Consider log_poly2 for better behavior at extremes.\n"
+      )
+    }
+    
+    suggestions
+  })
+  
+  # calculate equations for all device/vessel combinations
+  all_equations <- reactive({
+    req(uploaded_data())
+    
+    data <- uploaded_data()
+    # get unique combinations
+    unique_combos <- unique(data[, c(2, 3)])
+    colnames(unique_combos) <- c("device", "vessel")
+    
+    results_list <- list()
+    
+    # show progress bar
+    withProgress(message = 'Calculating equations', value = 0, {
+      
+      for(i in 1:nrow(unique_combos)) {
+        device <- unique_combos$device[i]
+        vessel <- unique_combos$vessel[i]
+        
+        # update progress
+        incProgress(1/nrow(unique_combos), detail = paste(device, "-", vessel))
+        
+        # filter data
+        filtered <- data[data[, 2] == device & data[, 3] == vessel, ]
+        
+        # extract values
+        bp_mode <- as.numeric(filtered[, 10])
+        energy_j <- as.numeric(filtered[, 17])
+        
+        # clean data
+        valid <- !is.na(bp_mode) & !is.na(energy_j) & energy_j > 0 & bp_mode > 0
+        bp_mode <- bp_mode[valid]
+        energy_j <- energy_j[valid]
+        
+        # check if enough data
+        if(length(bp_mode) < 3) {
+          results_list[[i]] <- data.frame(
+            device = device,
+            vessel = vessel,
+            n_points = length(bp_mode),
+            best_model = NA,
+            aic = NA,
+            bic = NA,
+            r_squared = NA,
+            adj_r_squared = NA,
+            rse = NA,
+            bp_min = ifelse(length(bp_mode) > 0, min(bp_mode), NA),
+            bp_max = ifelse(length(bp_mode) > 0, max(bp_mode), NA),
+            equation = NA,
+            coefficients = NA,
+            status = "insufficient data"
+          )
+          next
+        }
+        
+        # try to fit models
+        tryCatch({
+          df_model <- data.frame(bp_mode = bp_mode, energy_j = energy_j)
+          models <- list()
+          
+          # fit various model types - same as in calculate button
+          models <- list()
+          
+          # log-transformed models
+          models$log_linear <- lm(log(energy_j) ~ bp_mode, data = df_model)
+          models$log_poly2 <- lm(log(energy_j) ~ poly(bp_mode, 2, raw = TRUE), data = df_model)
+          if(length(bp_mode) > 5) models$log_poly3 <- lm(log(energy_j) ~ poly(bp_mode, 3, raw = TRUE), data = df_model)
+          
+          # power law model
+          models$power <- lm(log(energy_j) ~ log(bp_mode), data = df_model)
+          
+          # polynomial degree 4 if enough data (at least 7 points)
+          if(length(bp_mode) > 7) models$poly4 <- lm(energy_j ~ poly(bp_mode, 4, raw = TRUE), data = df_model)
+          
+          # find best model by aic
+          aics <- sapply(models, AIC)
+          best_model_name <- names(which.min(aics))
+          best_model <- models[[best_model_name]]
+          
+          # format equation string based on model type
+          coefs <- coef(best_model)
+          equation <- switch(best_model_name,
+                             "log_linear" = sprintf("E = exp(%.3f + %.6f*bp)", coefs[1], coefs[2]),
+                             "log_poly2" = sprintf("E = exp(%.3f + %.6f*bp + %.9f*bp²)", 
+                                                   coefs[1], coefs[2], coefs[3]),
+                             "log_poly3" = sprintf("E = exp(%.3f + %.6f*bp + %.9f*bp² + %.12f*bp³)", 
+                                                   coefs[1], coefs[2], coefs[3], coefs[4]),
+                             "power" = sprintf("E = exp(%.3f) * bp^%.3f", coefs[1], coefs[2]),
+                             "poly4" = sprintf("E = %.3f + %.6f*bp + %.9f*bp² + %.12f*bp³ + %.15f*bp⁴", 
+                                               coefs[1], coefs[2], coefs[3], coefs[4], coefs[5]),
+                             "unknown"
+          )
+          
+          # store coefficients as string
+          coef_string <- paste(names(coefs), "=", round(coefs, 6), collapse = "; ")
+          
+          # save results
+          results_list[[i]] <- data.frame(
+            device = device,
+            vessel = vessel,
+            n_points = length(bp_mode),
+            best_model = best_model_name,
+            aic = AIC(best_model),
+            bic = BIC(best_model),
+            r_squared = summary(best_model)$r.squared,
+            adj_r_squared = summary(best_model)$adj.r.squared,
+            rse = summary(best_model)$sigma,
+            bp_min = min(bp_mode),
+            bp_max = max(bp_mode),
+            equation = equation,
+            coefficients = coef_string,
+            status = "success"
+          )
+          
+        }, error = function(e) {
+          # if error, store na values
+          results_list[[i]] <- data.frame(
+            device = device,
+            vessel = vessel,
+            n_points = length(bp_mode),
+            best_model = NA,
+            aic = NA,
+            bic = NA,
+            r_squared = NA,
+            adj_r_squared = NA,
+            rse = NA,
+            bp_min = min(bp_mode),
+            bp_max = max(bp_mode),
+            equation = NA,
+            coefficients = NA,
+            status = paste("error:", e$message)
+          )
+        })
+      }
+    })
+    
+    # combine all results
+    do.call(rbind, results_list)
+  })
+  
+  # display all equations table
+  output$all_equations_table <- renderTable({
     req(all_equations())
     
-    # get equations with successful fits
+    display_df <- all_equations()
+    
+    # round numeric columns for display
+    numeric_cols <- c("aic", "bic", "r_squared", "adj_r_squared", "rse")
+    display_df[numeric_cols] <- lapply(display_df[numeric_cols], function(x) round(x, 3))
+    
+    # select columns to display
+    display_df[, c("device", "vessel", "best_model", "n_points", 
+                   "aic", "r_squared", "equation", "status")]
+  })
+  
+  # download handler for equations
+  output$download_equations <- downloadHandler(
+    filename = function() {
+      paste0("dna_shearing_equations_", Sys.Date(), ".csv")
+    },
+    content = function(file) {
+      write.csv(all_equations(), file, row.names = FALSE)
+    }
+  )
+  
+  # example curves plot
+  output$example_curves <- renderPlot({
+    req(all_equations(), uploaded_data())
+    
     equations_df <- all_equations()
     successful <- equations_df[equations_df$status == "success", ]
     
-    # limit to first 4 for display
-    n_plots <- min(4, nrow(successful))
+    # get variety of model types
+    model_types <- unique(successful$best_model)
+    n_types <- min(4, length(model_types))
     
-    if(n_plots == 0) {
-      plot(1, type = "n", xlab = "", ylab = "", main = "No successful models to display")
+    if(n_types == 0) {
+      plot(1, type = "n", xlab = "", ylab = "", main = "No successful models")
       return()
     }
     
-    # set up plot grid
+    # 2x2 plot layout
     par(mfrow = c(2, 2))
     
-    # plot each equation
-    for(i in 1:n_plots) {
-      row <- successful[i, ]
+    # plot one example of each model type
+    for(i in 1:n_types) {
+      model_type <- model_types[i]
+      example <- successful[successful$best_model == model_type, ][1, ]
       
-      # create bp sequence for smooth curve
-      bp_seq <- seq(row$bp_min, row$bp_max, length.out = 100)
+      # get actual data for this device/vessel
+      data <- uploaded_data()
+      filtered <- data[data[, 2] == example$device & data[, 3] == example$vessel, ]
+      bp_data <- as.numeric(filtered[, 10])
+      energy_data <- as.numeric(filtered[, 17])
+      valid <- !is.na(bp_data) & !is.na(energy_data) & energy_data > 0 & bp_data > 0
+      bp_data <- bp_data[valid]
+      energy_data <- energy_data[valid]
       
-      # calculate predicted energy using the equation
-      log_energy <- row$intercept + row$bp_coef * bp_seq + row$bp2_coef * bp_seq^2
-      energy <- exp(log_energy)
-      
-      # plot
-      plot(bp_seq, energy,
-           type = "l",
-           col = "blue",
-           lwd = 2,
-           main = paste(row$device, "-", row$vessel),
+      # plot data points
+      plot(bp_data, energy_data,
+           main = paste(example$device, "-", example$vessel, "\n", model_type, "model"),
            xlab = "Base Pair (bp)",
            ylab = "Energy (J)",
-           sub = paste("R² =", round(row$r_squared, 3)))
+           pch = 19,
+           col = "blue")
+      
+      # add model info
+      mtext(paste("AIC =", round(example$aic, 1), ", R² =", round(example$r_squared, 3)), 
+            side = 3, line = -1, cex = 0.8)
       
       # add grid
       grid()
     }
     
-    # reset plot parameters
+    # reset layout
     par(mfrow = c(1, 1))
   })
   
-  # display the equations table
-  output$log_poly2_table <- renderTable({
+  # equation summary statistics
+  output$equation_summary <- renderPrint({
     req(all_equations())
     
-    # format the dataframe for display
-    display_df <- all_equations()
+    equations_df <- all_equations()
+    successful <- equations_df[equations_df$status == "success", ]
     
-    # round numeric columns for better display
-    numeric_cols <- c("intercept", "bp_coef", "bp2_coef", "r_squared", "adj_r_squared", "rse")
-    display_df[numeric_cols] <- lapply(display_df[numeric_cols], function(x) round(x, 6))
-    
-    # add equation column for easy reading
-    display_df$equation <- ifelse(
-      !is.na(display_df$intercept),
-      paste0("log(E) = ", 
-             round(display_df$intercept, 3), " + ",
-             round(display_df$bp_coef, 6), "*bp + ",
-             round(display_df$bp2_coef, 9), "*bp²"),
-      "N/A"
-    )
-    
-    display_df
-  })
-  
-  # download handler for the equations
-  output$download_log_poly2 <- downloadHandler(
-    filename = function() {
-      paste0("dna_shearing_equations_", Sys.Date(), ".csv")
-    },
-    content = function(file) {
-      # get the equations dataframe
-      equations_df <- all_equations()
-      
-      # add some additional columns that might be useful
-      equations_df$equation_string <- ifelse(
-        !is.na(equations_df$intercept),
-        paste0("log(E) = ", 
-               equations_df$intercept, " + ",
-               equations_df$bp_coef, "*bp + ",
-               equations_df$bp2_coef, "*bp^2"),
-        "N/A"
-      )
-      
-      # add back-transformation note
-      equations_df$energy_formula <- ifelse(
-        !is.na(equations_df$intercept),
-        paste0("E = exp(", 
-               equations_df$intercept, " + ",
-               equations_df$bp_coef, "*bp + ",
-               equations_df$bp2_coef, "*bp^2)"),
-        "N/A"
-      )
-      
-      # write to csv
-      write.csv(equations_df, file, row.names = FALSE)
+    if(nrow(successful) == 0) {
+      cat("No successful model fits\n")
+      return()
     }
-  )
+    
+    cat("MODEL SELECTION SUMMARY\n")
+    cat("=======================\n")
+    cat("Total device/vessel combinations:", nrow(equations_df), "\n")
+    cat("Successful fits:", nrow(successful), "\n")
+    cat("Failed fits:", nrow(equations_df) - nrow(successful), "\n\n")
+    
+    cat("Best Model Distribution:\n")
+    model_counts <- table(successful$best_model)
+    for(model in names(model_counts)) {
+      cat(sprintf("  %s: %d (%.1f%%)\n", 
+                  model, 
+                  model_counts[model], 
+                  100 * model_counts[model] / nrow(successful)))
+    }
+    
+    cat("\nModel Quality (successful fits only):\n")
+    cat("Average R²:", round(mean(successful$r_squared), 3), "\n")
+    cat("Average AIC:", round(mean(successful$aic), 1), "\n")
+    cat("Average RSE:", round(mean(successful$rse), 1), "\n")
+    
+    cat("\nR² Distribution:\n")
+    r2_breaks <- c(0, 0.7, 0.8, 0.9, 0.95, 1)
+    r2_labels <- c("Poor (<0.7)", "Fair (0.7-0.8)", "Good (0.8-0.9)", 
+                   "Very Good (0.9-0.95)", "Excellent (>0.95)")
+    r2_cuts <- cut(successful$r_squared, breaks = r2_breaks, labels = r2_labels)
+    r2_table <- table(r2_cuts)
+    for(i in 1:length(r2_table)) {
+      if(r2_table[i] > 0) {
+        cat(sprintf("  %s: %d\n", names(r2_table)[i], r2_table[i]))
+      }
+    }
+  })
 }
 
-# launch the app! yippee!
+# run the application
 shinyApp(ui = ui, server = server)
